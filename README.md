@@ -1,8 +1,4 @@
-# qwen-infer
 
-I'm learning Rust so I wrote a small CPU inference engine for Qwen2.5-Coder-3B and tried to keep up with llama.cpp.
-
-No GPU, just CPU + GGUF + candle-core. It does the full Qwen2 decoder with KV-cache and greedy / temp sampling, and prints prefill and decode tok/s separately so you can compare head to head.
 
 ## Model
 
