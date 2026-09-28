@@ -80,11 +80,10 @@ fn softmax_last(x: &Tensor) -> Result<Tensor> {
     e.broadcast_div(&s).map_err(anyhow::Error::msg)
 }
 
-fn attn_grouped(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, off: usize, t: usize, dev: &Device) -> Result<Tensor> {
+fn attn_grouped(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, mask: Option<&Tensor>) -> Result<Tensor> {
     let n_kv = k.dim(1).map_err(anyhow::Error::msg)?;
     let n_h = q.dim(1).map_err(anyhow::Error::msg)?;
     let gsize = n_h / n_kv;
-    let kt = k.dim(2).map_err(anyhow::Error::msg)?;
     let mut outs = Vec::new();
     for g in 0..n_kv {
         let qg = q.narrow(1, g * gsize, gsize).map_err(anyhow::Error::msg)?;
@@ -93,17 +92,8 @@ fn attn_grouped(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, off: usize, t: u
         let kt_ = kg.t().map_err(anyhow::Error::msg)?;
         let mut s = qg.broadcast_matmul(&kt_).map_err(anyhow::Error::msg)?;
         s = (s * scale).map_err(anyhow::Error::msg)?;
-        if t > 1 {
-            let mut m = vec![0f32; t * kt];
-            for i in 0..t {
-                for j in 0..kt {
-                    if j > off + i {
-                        m[i * kt + j] = -1e9;
-                    }
-                }
-            }
-            let mask = Tensor::from_vec(m, (t, kt), dev).map_err(anyhow::Error::msg)?.broadcast_as((1, gsize, t, kt)).map_err(anyhow::Error::msg)?;
-            s = s.broadcast_add(&mask).map_err(anyhow::Error::msg)?;
+        if let Some(m) = mask {
+            s = s.broadcast_add(m).map_err(anyhow::Error::msg)?;
         }
         let p = softmax_last(&s)?;
         let o = p.broadcast_matmul(&vg).map_err(anyhow::Error::msg)?;
@@ -205,6 +195,26 @@ impl Weights {
         let cos_q = cos_all.reshape((1, 1, t, hd)).map_err(anyhow::Error::msg)?;
         let sin_q = sin_all.reshape((1, 1, t, hd)).map_err(anyhow::Error::msg)?;
 
+        let mask = if t > 1 {
+            let n_h = cfg.num_attention_heads;
+            let mut m = vec![0f32; t * (off + t)];
+            for i in 0..t {
+                for j in 0..(off + t) {
+                    if j > off + i {
+                        m[i * (off + t) + j] = -1e9;
+                    }
+                }
+            }
+            Some(
+                Tensor::from_vec(m, (t, off + t), dev)
+                    .map_err(anyhow::Error::msg)?
+                    .broadcast_as((1, 1, t, off + t))
+                    .map_err(anyhow::Error::msg)?,
+            )
+        } else {
+            None
+        };
+
         for (li, lw) in self.layers.iter().enumerate() {
             let r = lw.attn_norm.forward(&h)?;
             let mut q = lw.q.forward(&r).map_err(anyhow::Error::msg)?;
@@ -229,7 +239,7 @@ impl Weights {
 
             let (k, v) = cache.layers[li].update(k, v)?;
 
-            let o = attn_grouped(&q, &k, &v, scale, off, t, dev)?;
+            let o = attn_grouped(&q, &k, &v, scale, mask.as_ref())?;
             let o = o.transpose(1, 2).map_err(anyhow::Error::msg)?.reshape((1, t, cfg.hidden_size)).map_err(anyhow::Error::msg)?;
             let o = lw.o.forward(&o).map_err(anyhow::Error::msg)?;
             h = (&h + &o).map_err(anyhow::Error::msg)?;
