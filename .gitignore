@@ -1,1 +1,10 @@
 /target
+Cargo.lock
+*.gguf
+*.bin
+*.safetensors
+models/
+.env
+.DS_Store
+*.log
+perf/
