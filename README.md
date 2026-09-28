@@ -38,6 +38,13 @@ cargo run --release -- --gguf qwen2.5-coder-3b-instruct-q4_k_m.gguf --prompt "<1
 
 Compare prefill tok/s (prompt processing) and decode tok/s separately, plus peak RSS. Same threads, same machine, 5 runs, drop the cold one.
 
+Measured here (6 threads, Q4_K_M, 24 prompt + 32 gen):
+
+- llama.cpp: pp 56 tok/s, tg 11.2 tok/s
+- qwen-infer: prefill 11 tok/s, decode 8.2 tok/s
+
+Decode is in the same ballpark, prefill lags because there is no flash attention or fused prefill path yet.
+
 ## Layout
 
 - `src/config.rs` model dims
