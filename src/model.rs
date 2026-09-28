@@ -69,16 +69,6 @@ fn rope_apply(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     a.broadcast_add(&b).map_err(anyhow::Error::msg)
 }
 
-fn repeat_kv(x: &Tensor, n: usize) -> Result<Tensor> {
-    if n == 1 {
-        return Ok(x.clone());
-    }
-    let (b, kv, t, d) = x.dims4().map_err(anyhow::Error::msg)?;
-    let x = x.unsqueeze(2).map_err(anyhow::Error::msg)?;
-    let x = x.broadcast_as((b, kv, n, t, d)).map_err(anyhow::Error::msg)?;
-    x.reshape((b, kv * n, t, d)).map_err(anyhow::Error::msg)
-}
-
 fn softmax_last(x: &Tensor) -> Result<Tensor> {
     let m = x.max_keepdim(D::Minus1).map_err(anyhow::Error::msg)?;
     let e = x
@@ -88,6 +78,38 @@ fn softmax_last(x: &Tensor) -> Result<Tensor> {
         .map_err(anyhow::Error::msg)?;
     let s = e.sum_keepdim(D::Minus1).map_err(anyhow::Error::msg)?;
     e.broadcast_div(&s).map_err(anyhow::Error::msg)
+}
+
+fn attn_grouped(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, off: usize, t: usize, dev: &Device) -> Result<Tensor> {
+    let n_kv = k.dim(1).map_err(anyhow::Error::msg)?;
+    let n_h = q.dim(1).map_err(anyhow::Error::msg)?;
+    let gsize = n_h / n_kv;
+    let kt = k.dim(2).map_err(anyhow::Error::msg)?;
+    let mut outs = Vec::new();
+    for g in 0..n_kv {
+        let qg = q.narrow(1, g * gsize, gsize).map_err(anyhow::Error::msg)?;
+        let kg = k.narrow(1, g, 1).map_err(anyhow::Error::msg)?;
+        let vg = v.narrow(1, g, 1).map_err(anyhow::Error::msg)?;
+        let kt_ = kg.t().map_err(anyhow::Error::msg)?;
+        let mut s = qg.broadcast_matmul(&kt_).map_err(anyhow::Error::msg)?;
+        s = (s * scale).map_err(anyhow::Error::msg)?;
+        if t > 1 {
+            let mut m = vec![0f32; t * kt];
+            for i in 0..t {
+                for j in 0..kt {
+                    if j > off + i {
+                        m[i * kt + j] = -1e9;
+                    }
+                }
+            }
+            let mask = Tensor::from_vec(m, (t, kt), dev).map_err(anyhow::Error::msg)?.broadcast_as((1, gsize, t, kt)).map_err(anyhow::Error::msg)?;
+            s = s.broadcast_add(&mask).map_err(anyhow::Error::msg)?;
+        }
+        let p = softmax_last(&s)?;
+        let o = p.broadcast_matmul(&vg).map_err(anyhow::Error::msg)?;
+        outs.push(o);
+    }
+    Tensor::cat(&outs.iter().collect::<Vec<_>>(), 1).map_err(anyhow::Error::msg)
 }
 
 pub struct LayerW {
@@ -177,7 +199,6 @@ impl Weights {
         let scale = 1.0 / (hd as f64).sqrt();
         let n_h = cfg.num_attention_heads;
         let n_kv = cfg.num_key_value_heads;
-        let rep = cfg.kv_repeat();
 
         let cos_all = self.rot.cos.narrow(0, off, t).map_err(anyhow::Error::msg)?;
         let sin_all = self.rot.sin.narrow(0, off, t).map_err(anyhow::Error::msg)?;
@@ -207,29 +228,8 @@ impl Weights {
             let k = rope_apply(&k, &cos_q, &sin_q)?;
 
             let (k, v) = cache.layers[li].update(k, v)?;
-            let kt = k.dim(2).map_err(anyhow::Error::msg)?;
 
-            let k2 = repeat_kv(&k, rep)?;
-            let v2 = repeat_kv(&v, rep)?;
-
-            let mut scores = q.matmul(&k2.t().map_err(anyhow::Error::msg)?).map_err(anyhow::Error::msg)?;
-            scores = (scores * scale).map_err(anyhow::Error::msg)?;
-
-            if t > 1 {
-                let mut m = vec![0f32; t * kt];
-                for i in 0..t {
-                    for j in 0..kt {
-                        if j > off + i {
-                            m[i * kt + j] = -1e9;
-                        }
-                    }
-                }
-                let mask = Tensor::from_vec(m, (t, kt), dev).map_err(anyhow::Error::msg)?.broadcast_as((1, 1, t, kt)).map_err(anyhow::Error::msg)?;
-                scores = scores.broadcast_add(&mask).map_err(anyhow::Error::msg)?;
-            }
-
-            let p = softmax_last(&scores)?;
-            let o = p.matmul(&v2).map_err(anyhow::Error::msg)?;
+            let o = attn_grouped(&q, &k, &v, scale, off, t, dev)?;
             let o = o.transpose(1, 2).map_err(anyhow::Error::msg)?.reshape((1, t, cfg.hidden_size)).map_err(anyhow::Error::msg)?;
             let o = lw.o.forward(&o).map_err(anyhow::Error::msg)?;
             h = (&h + &o).map_err(anyhow::Error::msg)?;

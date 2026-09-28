@@ -37,8 +37,4 @@ impl Qwen2Config {
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
     }
-
-    pub fn kv_repeat(&self) -> usize {
-        self.num_attention_heads / self.num_key_value_heads
-    }
 }
