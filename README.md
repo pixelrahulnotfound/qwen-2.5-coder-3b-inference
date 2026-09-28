@@ -1,19 +1,18 @@
 # qwen-infer
 
-Small CPU inference engine for Qwen2.5-Coder-3B, built to learn Rust and to compare against llama.cpp.
+I'm learning Rust so I wrote a small CPU inference engine for Qwen2.5-Coder-3B and tried to keep up with llama.cpp.
 
-## Why
-
-llama.cpp is the reference. This repo reimplements the same Qwen2 decoder with `candle-core` tensors on CPU + GGUF weights, with KV-cache and greedy / temp sampling, so prefill tok/s and decode tok/s can be compared head to head.
+No GPU, just CPU + GGUF + candle-core. It does the full Qwen2 decoder with KV-cache and greedy / temp sampling, and prints prefill and decode tok/s separately so you can compare head to head.
 
 ## Model
 
-- Qwen2.5-Coder-3B-Instruct, qwen2 arch
-- hidden 2048, 36 layers, 16 Q heads / 2 KV heads, head_dim 128
-- SwiGLU 11008, vocab 151936, RMSNorm eps 1e-6, RoPE theta 1M, tied embeddings
-- Weights: GGUF (`Q4_K_M` for bench parity, or F16 for correctness checks)
+Qwen2.5-Coder-3B-Instruct, the qwen2 arch one:
 
-## Run
+hidden 2048, 36 layers, 16 Q heads and only 2 KV heads, head_dim 128. SwiGLU with 11008 intermediate, vocab 151936, RMSNorm 1e-6, RoPE theta 1M. Embeddings are tied.
+
+I bench with the Q4_K_M GGUF since that's what llama.cpp uses. F16 is better if you just want to check correctness.
+
+## Run it
 
 ```bash
 cargo run --release -- --gguf /path/to/qwen2.5-coder-3b-instruct-q4_k_m.gguf --prompt "def fibonacci(n):" --max-tokens 256
@@ -25,31 +24,35 @@ With sampling:
 cargo run --release -- --gguf model.gguf --prompt "write quicksort in python" --temp 0.7 --top-p 0.8 --top-k 20 --max-tokens 256
 ```
 
-The tokenizer is fetched from `Qwen/Qwen2.5-Coder-3B-Instruct` via hf-hub on first run, or pass `--tokenizer tokenizer.json`.
+For the tokenizer pass `--tokenizer tokenizer.json` or let it find the cached one from the Qwen models in `~/.cache/huggingface`. Any Qwen2.5 tokenizer works, they all share the same vocab. If it can't find one it'll tell you to download it with huggingface-cli.
 
-## Bench vs llama.cpp
+Add `--raw` if you don't want the ChatML wrapper.
 
-Use the same file and sampler on both sides:
+## Against llama.cpp
+
+Same file, same sampler, same machine, that's the only fair way:
 
 ```bash
-llama-bench -m qwen2.5-coder-3b-instruct-q4_k_m.gguf -p 128 -n 256
-cargo run --release -- --gguf qwen2.5-coder-3b-instruct-q4_k_m.gguf --prompt "<128 token code prompt>" --max-tokens 256 --temp 0
+llama-bench -m qwen2.5-coder-3b-instruct-q4_k_m.gguf -p 24 -n 32
+RAYON_NUM_THREADS=6 ./target/release/qwen-infer --gguf qwen2.5-coder-3b-instruct-q4_k_m.gguf --prompt "def fibonacci(n):" --max-tokens 32 --temp 0
 ```
 
-Compare prefill tok/s (prompt processing) and decode tok/s separately, plus peak RSS. Same threads, same machine, 5 runs, drop the cold one.
+On my i9-13900H with 6 threads I get:
 
-Measured here (6 threads, Q4_K_M, 24 prompt + 32 gen, i9-13900H):
+- llama.cpp: pp 45.9, tg 11.7
+- this: prefill 26.9, decode 11.6
 
-- llama.cpp: pp 45.9 tok/s, tg 11.7 tok/s
-- qwen-infer: prefill 26.9 tok/s, decode 11.6 tok/s
+So decode basically ties now. Prefill is about half. The big wins were building with target-cpu=native + fat LTO, doing grouped attention instead of repeating the KV heads 8x, and hoisting the causal mask out of the layer loop. The rest of the prefill gap is just better quantized GEMM kernels and repacked weights, which is where llama.cpp has years on me.
 
-Decode ties llama.cpp single-stream after grouped GQA (no KV repeat allocs) + native LTO build. Prefill is 59% — remaining gap is quantized GEMM blocking + repacked weights, which is hand-SIMD territory.
+Run it a few times and drop the first, laptop thermals make the numbers jump around.
 
-## Layout
+## Code
 
-- `src/config.rs` model dims
-- `src/loader.rs` GGUF loading
-- `src/model.rs` RMSNorm, RoPE, attention, MLP, full decoder
-- `src/cache.rs` KV cache
-- `src/sampler.rs` greedy / temp / top-k / top-p
-- `src/main.rs` CLI + generate loop + stats
+Nothing fancy:
+
+- `config.rs` just the dims for the 3B model
+- `loader.rs` opens the GGUF with candle's gguf reader
+- `model.rs` RMSNorm, RoPE, attention, MLP, the whole forward
+- `cache.rs` KV-cache per layer
+- `sampler.rs` greedy plus temp / top-k / top-p
+- `main.rs` CLI, ChatML prompt, generate loop, timing
